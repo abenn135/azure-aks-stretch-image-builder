@@ -1,0 +1,331 @@
+name: Build AKS VM Image (Local)
+
+on:
+  workflow_dispatch:
+    inputs:
+      # Source image parameters
+      source_subscription_id:
+        description: 'Azure Subscription ID for source image'
+        required: true
+        type: string
+      source_resource_group:
+        description: 'Resource group containing source gallery'
+        required: true
+        type: string
+      source_gallery_name:
+        description: 'Source Azure Compute Gallery name'
+        required: true
+        type: string
+      source_image_name:
+        description: 'Source image definition name'
+        required: true
+        type: string
+      source_image_version:
+        description: 'Source image version (e.g., 1.0.0 or latest)'
+        required: true
+        type: string
+        default: 'latest'
+
+      # Destination image parameters
+      destination_subscription_id:
+        description: 'Azure Subscription ID for destination image'
+        required: true
+        type: string
+      destination_resource_group:
+        description: 'Resource group containing destination gallery'
+        required: true
+        type: string
+      destination_gallery_name:
+        description: 'Destination Azure Compute Gallery name'
+        required: true
+        type: string
+      destination_image_name:
+        description: 'Destination image definition name'
+        required: true
+        type: string
+      destination_image_version:
+        description: 'Destination image version (e.g., 1.0.0)'
+        required: true
+        type: string
+
+      # Storage account for VHD transfer
+      storage_account_name:
+        description: 'Storage account for VHD transfer'
+        required: true
+        type: string
+      storage_container_name:
+        description: 'Blob container name for VHD files'
+        required: true
+        type: string
+        default: 'vhd-images'
+
+      # Replication configuration (JSON array)
+      # Example: [{"region": "eastus", "replica_count": 1}, {"region": "westus2", "replica_count": 2}]
+      replication_regions:
+        description: 'JSON array of regions and replica counts'
+        required: true
+        type: string
+        default: '[{"region": "eastus", "replica_count": 1}]'
+
+permissions:
+  id-token: write  # Required for OIDC
+  contents: read
+
+env:
+  WORK_DIR: /mnt/vhd-work
+  MOUNT_POINT: /mnt/image-root
+
+jobs:
+  build:
+    name: Build VM Image (Local)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install required tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ inputs.source_subscription_id }}
+
+      - name: Create work directory
+        run: |
+          sudo mkdir -p ${{ env.WORK_DIR }}
+          sudo mkdir -p ${{ env.MOUNT_POINT }}
+          sudo chown -R $USER:$USER ${{ env.WORK_DIR }}
+
+      - name: Get source image version ID
+        id: get-source
+        run: |
+          # Resolve 'latest' to actual version if needed
+          if [ "${{ inputs.source_image_version }}" == "latest" ]; then
+            VERSION=$(az sig image-version list \
+              --subscription "${{ inputs.source_subscription_id }}" \
+              --resource-group "${{ inputs.source_resource_group }}" \
+              --gallery-name "${{ inputs.source_gallery_name }}" \
+              --gallery-image-definition "${{ inputs.source_image_name }}" \
+              --query "sort_by([].{name:name, date:publishingProfile.publishedDate}, &date)[-1].name" \
+              --output tsv)
+          else
+            VERSION="${{ inputs.source_image_version }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Resolved source image version: $VERSION"
+
+      - name: Export source image to VHD
+        id: export-vhd
+        run: |
+          echo "Creating temporary disk from gallery image..."
+          
+          # Get the image version resource ID
+          IMAGE_VERSION_ID=$(az sig image-version show \
+            --subscription "${{ inputs.source_subscription_id }}" \
+            --resource-group "${{ inputs.source_resource_group }}" \
+            --gallery-name "${{ inputs.source_gallery_name }}" \
+            --gallery-image-definition "${{ inputs.source_image_name }}" \
+            --gallery-image-version "${{ steps.get-source.outputs.version }}" \
+            --query "id" --output tsv)
+          
+          echo "Image version ID: $IMAGE_VERSION_ID"
+          
+          # Create a managed disk from the image
+          DISK_NAME="temp-export-disk-${{ github.run_id }}"
+          
+          # Get the first replication region for disk creation
+          LOCATION=$(echo '${{ inputs.replication_regions }}' | jq -r '.[0].region')
+          
+          az disk create \
+            --subscription "${{ inputs.source_subscription_id }}" \
+            --resource-group "${{ inputs.source_resource_group }}" \
+            --name "$DISK_NAME" \
+            --location "$LOCATION" \
+            --gallery-image-reference "$IMAGE_VERSION_ID" \
+            --hyper-v-generation V2
+          
+          echo "disk_name=$DISK_NAME" >> $GITHUB_OUTPUT
+          echo "location=$LOCATION" >> $GITHUB_OUTPUT
+          
+          # Generate SAS URL for download
+          echo "Generating SAS URL for disk download..."
+          az disk grant-access \
+            --subscription "${{ inputs.source_subscription_id }}" \
+            --resource-group "${{ inputs.source_resource_group }}" \
+            --name "$DISK_NAME" \
+            --duration-in-seconds 3600 \
+            --access-level Read \
+            --query "accessSas" --output tsv > ${{ env.WORK_DIR }}/sas_url.txt
+
+      - name: Download VHD
+        run: |
+          echo "Downloading VHD from Azure..."
+          SAS_URL=$(cat ${{ env.WORK_DIR }}/sas_url.txt)
+          
+          # Use azcopy for faster download (pre-installed on GitHub runners)
+          azcopy copy "$SAS_URL" "${{ env.WORK_DIR }}/source.vhd"
+          
+          echo "Download complete. VHD size:"
+          ls -lh ${{ env.WORK_DIR }}/source.vhd
+
+      - name: Revoke disk access
+        run: |
+          az disk revoke-access \
+            --subscription "${{ inputs.source_subscription_id }}" \
+            --resource-group "${{ inputs.source_resource_group }}" \
+            --name "${{ steps.export-vhd.outputs.disk_name }}"
+
+      - name: Mount VHD and setup chroot
+        id: mount
+        run: |
+          echo "Loading NBD kernel module..."
+          sudo modprobe nbd max_part=16
+          
+          echo "Connecting VHD to NBD device..."
+          sudo qemu-nbd --connect=/dev/nbd0 ${{ env.WORK_DIR }}/source.vhd
+          
+          # Wait for device to be ready
+          sleep 2
+          
+          echo "Partition layout:"
+          sudo fdisk -l /dev/nbd0
+          
+          # Find the root partition (usually the largest Linux partition)
+          # This may need adjustment based on the source image layout
+          ROOT_PART=$(lsblk -ln -o NAME,FSTYPE /dev/nbd0 | grep -E 'ext4|xfs' | head -1 | awk '{print $1}')
+          
+          if [ -z "$ROOT_PART" ]; then
+            echo "Could not find root partition, listing all partitions:"
+            lsblk -ln /dev/nbd0
+            # Default to partition 2 (common for Azure Linux images)
+            ROOT_PART="nbd0p2"
+          fi
+          
+          echo "Mounting /dev/$ROOT_PART to ${{ env.MOUNT_POINT }}..."
+          sudo mount /dev/$ROOT_PART ${{ env.MOUNT_POINT }}
+          
+          echo "root_partition=$ROOT_PART" >> $GITHUB_OUTPUT
+          
+          # Setup chroot environment
+          echo "Setting up chroot environment..."
+          sudo mount --bind /dev ${{ env.MOUNT_POINT }}/dev
+          sudo mount --bind /dev/pts ${{ env.MOUNT_POINT }}/dev/pts
+          sudo mount --bind /proc ${{ env.MOUNT_POINT }}/proc
+          sudo mount --bind /sys ${{ env.MOUNT_POINT }}/sys
+          sudo mount --bind /run ${{ env.MOUNT_POINT }}/run || true
+          
+          # Copy resolv.conf for network access in chroot
+          sudo cp /etc/resolv.conf ${{ env.MOUNT_POINT }}/etc/resolv.conf
+          
+          echo "Chroot environment ready!"
+
+      - name: Run customization in chroot
+        run: |
+          echo "Copying scripts to chroot..."
+          sudo cp -r scripts ${{ env.MOUNT_POINT }}/tmp/scripts
+          sudo chmod +x ${{ env.MOUNT_POINT }}/tmp/scripts/*.sh
+          
+          echo "Running install-packages.sh in chroot..."
+          sudo chroot ${{ env.MOUNT_POINT }} /bin/bash -c "/tmp/scripts/install-packages.sh"
+          
+          echo "Cleaning up scripts..."
+          sudo rm -rf ${{ env.MOUNT_POINT }}/tmp/scripts
+
+      - name: Cleanup chroot and unmount
+        run: |
+          echo "Cleaning up chroot environment..."
+          
+          # Unmount in reverse order
+          sudo umount ${{ env.MOUNT_POINT }}/run || true
+          sudo umount ${{ env.MOUNT_POINT }}/sys || true
+          sudo umount ${{ env.MOUNT_POINT }}/proc || true
+          sudo umount ${{ env.MOUNT_POINT }}/dev/pts || true
+          sudo umount ${{ env.MOUNT_POINT }}/dev || true
+          sudo umount ${{ env.MOUNT_POINT }}
+          
+          echo "Disconnecting NBD device..."
+          sudo qemu-nbd --disconnect /dev/nbd0
+          
+          echo "VHD unmounted and ready for upload"
+
+      - name: Upload modified VHD to Azure Storage
+        run: |
+          echo "Getting storage account key..."
+          STORAGE_KEY=$(az storage account keys list \
+            --subscription "${{ inputs.destination_subscription_id }}" \
+            --resource-group "${{ inputs.destination_resource_group }}" \
+            --account-name "${{ inputs.storage_account_name }}" \
+            --query "[0].value" --output tsv)
+          
+          # Create container if it doesn't exist
+          az storage container create \
+            --account-name "${{ inputs.storage_account_name }}" \
+            --account-key "$STORAGE_KEY" \
+            --name "${{ inputs.storage_container_name }}" \
+            --public-access off || true
+          
+          VHD_BLOB_NAME="${{ inputs.destination_image_name }}-${{ inputs.destination_image_version }}.vhd"
+          
+          echo "Uploading VHD as page blob..."
+          az storage blob upload \
+            --account-name "${{ inputs.storage_account_name }}" \
+            --account-key "$STORAGE_KEY" \
+            --container-name "${{ inputs.storage_container_name }}" \
+            --name "$VHD_BLOB_NAME" \
+            --file "${{ env.WORK_DIR }}/source.vhd" \
+            --type page \
+            --overwrite
+          
+          # Get blob URL
+          BLOB_URL="https://${{ inputs.storage_account_name }}.blob.core.windows.net/${{ inputs.storage_container_name }}/$VHD_BLOB_NAME"
+          echo "VHD uploaded to: $BLOB_URL"
+          echo "blob_url=$BLOB_URL" >> $GITHUB_ENV
+
+      - name: Create image version in destination gallery
+        run: |
+          echo "Creating image version in destination gallery..."
+          
+          # Parse replication regions
+          REGIONS_JSON='${{ inputs.replication_regions }}'
+          
+          # Build target regions argument
+          TARGET_REGIONS=""
+          for row in $(echo "$REGIONS_JSON" | jq -c '.[]'); do
+            REGION=$(echo "$row" | jq -r '.region')
+            COUNT=$(echo "$row" | jq -r '.replica_count')
+            TARGET_REGIONS="$TARGET_REGIONS $REGION=$COUNT"
+          done
+          
+          LOCATION=$(echo "$REGIONS_JSON" | jq -r '.[0].region')
+          
+          az sig image-version create \
+            --subscription "${{ inputs.destination_subscription_id }}" \
+            --resource-group "${{ inputs.destination_resource_group }}" \
+            --gallery-name "${{ inputs.destination_gallery_name }}" \
+            --gallery-image-definition "${{ inputs.destination_image_name }}" \
+            --gallery-image-version "${{ inputs.destination_image_version }}" \
+            --location "$LOCATION" \
+            --os-vhd-uri "${{ env.blob_url }}" \
+            --os-vhd-storage-account "${{ inputs.storage_account_name }}" \
+            --target-regions $TARGET_REGIONS
+          
+          echo "Image version created successfully!"
+
+      - name: Cleanup temporary resources
+        if: always()
+        run: |
+          echo "Cleaning up temporary disk..."
+          az disk delete \
+            --subscription "${{ inputs.source_subscription_id }}" \
+            --resource-group "${{ inputs.source_resource_group }}" \
+            --name "${{ steps.export-vhd.outputs.disk_name }}" \
+            --yes || true
+          
+          echo "Cleaning up local files..."
+          sudo rm -rf ${{ env.WORK_DIR }}/* || true
