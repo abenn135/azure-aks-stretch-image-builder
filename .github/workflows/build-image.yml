@@ -257,17 +257,9 @@ jobs:
 
       - name: Upload modified VHD to Azure Storage
         run: |
-          echo "Getting storage account key..."
-          STORAGE_KEY=$(az storage account keys list \
-            --subscription "${{ inputs.destination_subscription_id }}" \
-            --resource-group "${{ inputs.destination_resource_group }}" \
-            --account-name "${{ inputs.storage_account_name }}" \
-            --query "[0].value" --output tsv)
-          
           # Create container if it doesn't exist
           az storage container create \
             --account-name "${{ inputs.storage_account_name }}" \
-            --account-key "$STORAGE_KEY" \
             --name "${{ inputs.storage_container_name }}" \
             --public-access off || true
           
@@ -276,7 +268,6 @@ jobs:
           echo "Uploading VHD as page blob..."
           az storage blob upload \
             --account-name "${{ inputs.storage_account_name }}" \
-            --account-key "$STORAGE_KEY" \
             --container-name "${{ inputs.storage_container_name }}" \
             --name "$VHD_BLOB_NAME" \
             --file "${{ env.WORK_DIR }}/source.vhd" \
