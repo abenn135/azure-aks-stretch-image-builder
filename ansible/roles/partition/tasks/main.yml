@@ -1,0 +1,75 @@
+---
+# Partition role - discovers boot disk and splits it into two roughly equal partitions
+
+# Discover the boot/OS disk
+- name: Get the mount point for root filesystem
+  ansible.builtin.command: findmnt -n -o SOURCE /
+  register: root_mount_source
+  changed_when: false
+
+- name: Extract the base disk device from root partition
+  ansible.builtin.set_fact:
+    root_partition: "{{ root_mount_source.stdout }}"
+    # Remove partition number suffix to get base disk (e.g., /dev/sda1 -> /dev/sda, /dev/nvme0n1p1 -> /dev/nvme0n1)
+    boot_disk: "{{ root_mount_source.stdout | regex_replace('p?[0-9]+$', '') }}"
+
+- name: Display discovered boot disk
+  ansible.builtin.debug:
+    msg: "Boot disk: {{ boot_disk }}, Root partition: {{ root_partition }}"
+
+- name: Get disk size in bytes using lsblk
+  ansible.builtin.command: "lsblk -b -d -n -o SIZE {{ boot_disk }}"
+  register: disk_size_bytes
+  changed_when: false
+
+- name: Calculate disk size in MiB and partition sizes
+  ansible.builtin.set_fact:
+    disk_size_mib: "{{ (disk_size_bytes.stdout | int / 1048576) | int }}"
+    # Reserve first partition at roughly half the disk
+    partition1_end_mib: "{{ ((disk_size_bytes.stdout | int / 1048576) / 2) | int }}"
+    # Second partition starts where first ends
+    partition2_start_mib: "{{ ((disk_size_bytes.stdout | int / 1048576) / 2) | int }}"
+
+- name: Display disk size information
+  ansible.builtin.debug:
+    msg: "Disk size: {{ disk_size_mib }} MiB, Partition 1 end: {{ partition1_end_mib }} MiB, Partition 2 start: {{ partition2_start_mib }} MiB"
+
+- name: Get current partition information
+  community.general.parted:
+    device: "{{ boot_disk }}"
+    state: info
+  register: disk_info
+
+- name: Display current partition layout
+  ansible.builtin.debug:
+    var: disk_info
+
+# Resize the existing root partition to use only the first half of the disk
+- name: Resize existing root partition to first half of disk
+  community.general.parted:
+    device: "{{ boot_disk }}"
+    number: "{{ (disk_info.partitions | selectattr('fstype', 'defined') | list | last).num | default(1) }}"
+    part_end: "{{ partition1_end_mib }}MiB"
+    resize: true
+    state: present
+  when: disk_info.partitions | length > 0
+
+# Create the second partition for the new OS
+- name: Create second partition for new OS installation
+  community.general.parted:
+    device: "{{ boot_disk }}"
+    number: "{{ (disk_info.partitions | length) + 1 }}"
+    part_start: "{{ partition2_start_mib }}MiB"
+    part_end: "100%"
+    state: present
+    fs_type: ext4
+
+- name: Get updated partition information
+  community.general.parted:
+    device: "{{ boot_disk }}"
+    state: info
+  register: updated_disk_info
+
+- name: Display new partition layout
+  ansible.builtin.debug:
+    msg: "Disk partitioning complete. New partition layout: {{ updated_disk_info.partitions }}"
