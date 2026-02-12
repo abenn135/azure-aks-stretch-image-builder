@@ -16,7 +16,7 @@ SIG_DEFINITION_NAME=${SIG_DEFINITION_NAME:-alexbenntestdef}
 IMAGE_VERSION_NUMBER=${IMAGE_VERSION_NUMBER:-1.0.0}
 DELETE_DISK=${DELETE_DISK:-true}
 
-az account set --subscription $AZURE_SUBSCRIPTION_ID  # standalone
+az account set --subscription $AZURE_SUBSCRIPTION_ID
 
 if ! az group show -n $GROUP &>/dev/null; then
   echo "Creating resource group $GROUP in $LOCATION..."
