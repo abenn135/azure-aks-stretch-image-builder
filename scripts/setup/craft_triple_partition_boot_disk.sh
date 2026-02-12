@@ -2,29 +2,36 @@
 
 set -euo pipefail
 
-az account set --subscription 8ecadfc9-d1a3-4ea4-b844-0d9f87e4d7c8  # standalone
+AZURE_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID:-8ecadfc9-d1a3-4ea4-b844-0d9f87e4d7c8}
+GROUP=${GROUP:-alexbenn-test}
+LOCATION=${LOCATION:-eastus2}
+BUILDER_VM_NAME=${BUILDER_VM_NAME:-disk-thrower}
+BUILDER_VM_SKU=${BUILDER_VM_SKU:-Standard_D4s_v7}
+BASE_IMAGE_REFERENCE=${BASE_IMAGE_REFERENCE:-Canonical:ubuntu-24_04-lts:server:latest}
+DISK_NAME=${DISK_NAME:-throwndisk2}
+DISK_SIZE_GB=${DISK_SIZE_GB:-30}
+CREATE_SIG_VERSION=${CREATE_SIG_VERSION:-true}
+SIG_NAME=${SIG_NAME:-alexbenntestsig2}
+SIG_DEFINITION_NAME=${SIG_DEFINITION_NAME:-alexbenntestdef}
+IMAGE_VERSION_NUMBER=${IMAGE_VERSION_NUMBER:-1.0.0}
+DELETE_DISK=${DELETE_DISK:-true}
 
-GROUP=alexbenn-test-3
-LOCATION=eastus2
+az account set --subscription $AZURE_SUBSCRIPTION_ID  # standalone
+
 if ! az group show -n $GROUP &>/dev/null; then
   echo "Creating resource group $GROUP in $LOCATION..."
   az group create -l $LOCATION -n $GROUP
 fi
 
-VM_NAME=disk-thrower
-VM_SKU=Standard_D4s_v7
-if ! az vm show -g $GROUP -n $VM_NAME &>/dev/null; then
-    echo "Creating VM $VM_NAME in resource group $GROUP..."
-    az vm create -g $GROUP -l $LOCATION -n $VM_NAME \
-        --size $VM_SKU \
+if ! az vm show -g $GROUP -n $BUILDER_VM_NAME &>/dev/null; then
+    echo "Creating VM $BUILDER_VM_NAME in resource group $GROUP..."
+    az vm create -g $GROUP -l $LOCATION -n $BUILDER_VM_NAME \
+        --size $BUILDER_VM_SKU \
         --image Ubuntu2404 \
 else
-    echo "VM $VM_NAME already exists in resource group $GROUP. Skipping VM creation."
+    echo "VM $BUILDER_VM_NAME already exists in resource group $GROUP. Skipping VM creation."
 fi
 
-DISK_NAME=throwndisk1
-# Typical Canonical disks are 30GB. We want to create 3 partitions with enough space to hold the entire OS on each, so we need at least 90GB. 128GB is the next available size step in Azure.
-DISK_SIZE_GB=128
 if ! az disk show -g $GROUP -n $DISK_NAME &>/dev/null; then
     echo "Creating disk $DISK_NAME in resource group $GROUP..."
     az disk create --resource-group $GROUP \
@@ -32,13 +39,13 @@ if ! az disk show -g $GROUP -n $DISK_NAME &>/dev/null; then
         --sku Premium_LRS \
         --location $LOCATION \
         --size-gb $DISK_SIZE_GB \
-        --image-reference Canonical:ubuntu-24_04-lts:server:latest
-    az vm disk attach -g $GROUP --vm-name $VM_NAME --name $DISK_NAME
+        --image-reference $BASE_IMAGE_REFERENCE
+    az vm disk attach -g $GROUP --vm-name $BUILDER_VM_NAME --name $DISK_NAME
 else
     echo "Disk $DISK_NAME already exists in resource group $GROUP. Skipping disk creation."
 fi
 
-VM_IP=$(az vm show -g $GROUP -n $VM_NAME -d --query 'publicIps' -o tsv)
+VM_IP=$(az vm show -g $GROUP -n $BUILDER_VM_NAME -d --query 'publicIps' -o tsv)
 echo "VM IP: $VM_IP"
 echo "Waiting for VM to be ready for SSH..."
 while ! nc -z "$VM_IP" 22; do
@@ -56,36 +63,54 @@ if ! ssh $VM_IP "sudo bash ~/partition-disk.sh"; then
     exit 1
 fi
 
-az vm stop -g $GROUP -n $VM_NAME
+az vm deallocate -g $GROUP -n $BUILDER_VM_NAME
 
-SIG_NAME=alexbenntestsig2
-az sig create --gallery-name $SIG_NAME -g $GROUP
-DEFINITION_NAME=alexbenntestdef
-az sig image-definition create \
-    --gallery-image-definition $DEFINITION_NAME \
-    --gallery-name $SIG_NAME \
-    --features 'SecurityType=TrustedLaunch IsAcceleratedNetworkSupported=true DiskControllerTypes=SCSI,NVMe' \
-    --offer partitionedos \
-    --os-type Linux \
-    --publisher azure-aks \
-    --resource-group $GROUP \
-    --sku Ubuntu2404PartitionedTLNVMe
+if [ "$CREATE_SIG_VERSION" = "true" ]; then
+    echo "Creating SIG image version..."
+    if az sig show -g $GROUP -n $SIG_NAME &>/dev/null; then
+        echo "Shared Image Gallery $SIG_NAME already exists in resource group $GROUP. Skipping SIG creation."
+    else
+        echo "Creating Shared Image Gallery $SIG_NAME in resource group $GROUP..."
+        az sig create --gallery-name $SIG_NAME -g $GROUP
+    fi
 
-DISK_ID=$(az disk show -g $GROUP -n $DISK_NAME --query 'id' -o tsv)
-VERSION_NUMBER=1.0.0
-az sig image-version create \
-    --gallery-image-definition $DEFINITION_NAME \
-    --gallery-image-version $VERSION_NUMBER \
-    --gallery-name $SIG_NAME \
-    --resource-group $GROUP \
-    --os-snapshot $DISK_ID
-IMAGE_VERSION_ID=$(az sig image-version show --gallery-image-definition $DEFINITION_NAME --gallery-image-version $VERSION_NUMBER --gallery-name $SIG_NAME --resource-group $GROUP --query 'id' -o tsv)
-echo "image_version_id=$IMAGE_VERSION_ID"
+    if az sig image-definition show -g $GROUP --gallery-name $SIG_NAME -n $SIG_DEFINITION_NAME &>/dev/null; then
+        echo "Image definition $SIG_DEFINITION_NAME already exists in SIG $SIG_NAME. Skipping image definition creation."
+    else
+        echo "Creating image definition $SIG_DEFINITION_NAME in SIG $SIG_NAME..."
+        az sig image-definition create \
+            --gallery-image-definition $SIG_DEFINITION_NAME \
+            --gallery-name $SIG_NAME \
+            --features 'SecurityType=TrustedLaunch IsAcceleratedNetworkSupported=true DiskControllerTypes=SCSI,NVMe' \
+            --offer partitionedos \
+            --os-type Linux \
+            --publisher azure-aks \
+            --resource-group $GROUP \
+            --sku Ubuntu2404PartitionedTLNVMe
+    fi
+
+    DISK_ID=$(az disk show -g $GROUP -n $DISK_NAME --query 'id' -o tsv)
+    az sig image-version create \
+        --gallery-image-definition $SIG_DEFINITION_NAME \
+        --gallery-image-version $IMAGE_VERSION_NUMBER \
+        --gallery-name $SIG_NAME \
+        --resource-group $GROUP \
+        --os-snapshot $DISK_ID
+    IMAGE_VERSION_ID=$(az sig image-version show --gallery-image-definition $SIG_DEFINITION_NAME --gallery-image-version $IMAGE_VERSION_NUMBER --gallery-name $SIG_NAME --resource-group $GROUP --query 'id' -o tsv)
+    echo "image_version_id=$IMAGE_VERSION_ID"
+else
+    echo "Skipping SIG image version creation as CREATE_SIG_VERSION is set to false."
+fi
 
 # cleanup
 
 echo "Cleaning up resources..."
-az vm delete -g $GROUP -n $VM_NAME --yes
-echo "vm deleted. Deleting disk..."
-az disk delete -g $GROUP -n $DISK_NAME --yes
-echo "disk deleted. Done"
+az vm delete -g $GROUP -n $BUILDER_VM_NAME --yes
+echo "vm deleted."
+if [ "$DELETE_DISK" = "true" ]; then
+    echo "Deleting disk $DISK_NAME in resource group $GROUP..."
+    az disk delete -g $GROUP -n $DISK_NAME --yes
+    echo "disk deleted. Done"
+else
+    echo "Skipping disk deletion as DELETE_DISK is set to false."
+fi

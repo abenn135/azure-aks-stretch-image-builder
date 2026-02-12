@@ -1,6 +1,5 @@
-.PHONY: build
+.PHONY: buildimage
 
-build:
-	@echo "Running init and Packer image build..."
-	./scripts/setup/init_sig.sh
-	packer build packer/azure-ubuntu.pkr.hcl
+buildimage:
+	@echo "creating triple partition image..."
+	./scripts/setup/craft_triple_partition_boot_disk.sh
