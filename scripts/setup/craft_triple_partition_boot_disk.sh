@@ -3,6 +3,10 @@
 set -euo pipefail
 
 # Must specify AZURE_SUBSCRIPTION_ID out of band
+if [ -z "${AZURE_SUBSCRIPTION_ID:-}" ]; then
+  echo "Error: AZURE_SUBSCRIPTION_ID is not set. Please set it before running this script."
+  exit 1
+fi
 GROUP=${GROUP:-alexbenn-test}
 LOCATION=${LOCATION:-eastus2}
 BUILDER_VM_NAME=${BUILDER_VM_NAME:-disk-thrower}

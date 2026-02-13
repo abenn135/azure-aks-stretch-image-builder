@@ -1,17 +1,20 @@
 # azure-aks-stretch-image-builder
+
 Image builder for creating AKS Stretch images
 
-## Components of the Stretch ecosystem (proposed)
+## Components of the Stretch image ecosystem (draft 2)
 
-1. The base image
-    * This image starts with a standard published image (Ubuntu, RHEL, etc.) and modifies it to have two available equal-sized partitions.
-    * We also add necessary components to join an AKS cluster: containerd, runc, etc.
-    * Finally, this image includes the *part-runner*, which is used below.
-    * This image can be directly copied onto a local disk via a netboot OS.
-1. The image server
-    * This hosts metadata about available images: within a given image SKU, a list of available image versions including the "current/latest" one available in the current region, and a reference to where it can be retrieved.
-1. A part-image
-    * This is effectively the above image without the partition structure.
-1. The part-runner
-    * The *part-runner* fetches part-images in the background, mounts them, and copies them onto the inactive partition (i.e. "the other one" from whichever one is currently booted). It then updates GRUB to set the other partition as the default boot partition and reports to Kubernetes that the current node is eligible for reboot/upgrade, so that the customer can choose to move work off the current node in order to permit upgrade to proceed.
-    * If an upgrade is pending and no pods are running, then the part-runner reboots the current node.
+1. User managed role -- this grants the GitHub runner write access to a resource group, in order to create VMs and disks there during disk generation. See hack/create-oidc-connection.sh for initial setup of this role.
+1. Base image -- this may be a standard off-the-shelf image such as `Canonical:ubuntu-24_04-lts:server:latest`, or a custom SIG image.
+1. Image builder -- this repo contains a setup script and a build-time script.
+    * The setup script is invoked by the GitHub runner and creates and manipulates the builder VM and resulting disk.
+    * The build-time script runs on the VM and manipulates the disk during build time.
+    * See `scripts/setup/` and `scripts/build-time/` for those.
+1. Imager process -- this consists of a service for serving built images and a daemon that runs on the host machine to fetch new images, install them on a local partition, and update boot configuration. Initially, netboot performs the first imaging of the boot disk, but subsequent updates can be performed dynamically over time. This infrastructure is housed in <https://www.github.com/abenn135/azure-aks-stretch-imager/>.
+
+TODO:
+
+* Finish the script to reliably set up OIDC for GitHub.
+* Test the base image build process to build an ARM64 image suitable for Spark nodes in the test lab.
+  * Sidebar: make it easy to choose build channels that select between building an ARM64 and AMD64 image.
+* Finish the imager (only draft right now) and install it on the built image.
