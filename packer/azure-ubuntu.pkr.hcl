@@ -16,7 +16,7 @@ source "azure-arm" "base-image" {
 
   location = "eastus2"
   vm_size = "Standard_A2_v2_Gen2"
-  subscription_id = "8ecadfc9-d1a3-4ea4-b844-0d9f87e4d7c8"
+
   temp_resource_group_name = "alexbenn-aks-stretch-tmp-packer"
   use_azure_cli_auth = true
 }

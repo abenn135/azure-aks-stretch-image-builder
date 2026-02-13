@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-export AZURE_SUBSCRIPTION_ID="${AZURE_SUBSCRIPTION_ID:-8ecadfc9-d1a3-4ea4-b844-0d9f87e4d7c8}"
+# Must specify AZURE_SUBSCRIPTION_ID out of band
 export RESOURCE_GROUP_NAME="${RESOURCE_GROUP_NAME:-alexbenn-aks-stretch-test}"
 export SIG_NAME="${SIG_NAME:-aksstretchimagesig}"
 export SIG_IMAGE_DEFINITION="${SIG_IMAGE_DEFINITION:-aks-stretch}"

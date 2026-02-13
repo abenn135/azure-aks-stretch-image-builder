@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-AZURE_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID:-8ecadfc9-d1a3-4ea4-b844-0d9f87e4d7c8}
+# Must specify AZURE_SUBSCRIPTION_ID out of band
 GROUP=${GROUP:-alexbenn-test}
 LOCATION=${LOCATION:-eastus2}
 BUILDER_VM_NAME=${BUILDER_VM_NAME:-disk-thrower}
